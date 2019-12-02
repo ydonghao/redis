@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include "atomicvar.h"
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <math.h>
 #include <ctype.h>
@@ -160,6 +161,32 @@ client *createClient(int fd) {
     return c;
 }
 
+/* This funciton puts the client in the queue of clients that should write
+ * their output buffers to the socket. Note that it does not *yet* install
+ * the write handler, to start clients are put in a queue of clients that need
+ * to write, so we try to do that before returning in the event loop (see the
+ * handleClientsWithPendingWrites() function).
+ * If we fail and there is more data to write, compared to what the socket
+ * buffers can hold, then we'll really install the handler. */
+void clientInstallWriteHandler(client *c) {
+    /* Schedule the client to write the output buffers to the socket only
+     * if not already done and, for slaves, if the slave can actually receive
+     * writes at this stage. */
+    if (!(c->flags & CLIENT_PENDING_WRITE) &&
+        (c->replstate == REPL_STATE_NONE ||
+         (c->replstate == SLAVE_STATE_ONLINE && !c->repl_put_online_on_ack)))
+    {
+        /* Here instead of installing the write handler, we just flag the
+         * client and put it into a list of clients that have something
+         * to write to the socket. This way before re-entering the event
+         * loop, we can try to directly write to the client sockets avoiding
+         * a system call. We'll only really install the write handler if
+         * we'll not be able to write the whole reply at once. */
+        c->flags |= CLIENT_PENDING_WRITE;
+        listAddNodeHead(server.clients_pending_write,c);
+    }
+}
+
 /* This function is called every time we are going to transmit new data
  * to the client. The behavior is the following:
  *
@@ -197,24 +224,9 @@ int prepareClientToWrite(client *c) {
 
     if (c->fd <= 0) return C_ERR; /* Fake client for AOF loading. */
 
-    /* Schedule the client to write the output buffers to the socket only
-     * if not already done (there were no pending writes already and the client
-     * was yet not flagged), and, for slaves, if the slave can actually
-     * receive writes at this stage. */
-    if (!clientHasPendingReplies(c) &&
-        !(c->flags & CLIENT_PENDING_WRITE) &&
-        (c->replstate == REPL_STATE_NONE ||
-         (c->replstate == SLAVE_STATE_ONLINE && !c->repl_put_online_on_ack)))
-    {
-        /* Here instead of installing the write handler, we just flag the
-         * client and put it into a list of clients that have something
-         * to write to the socket. This way before re-entering the event
-         * loop, we can try to directly write to the client sockets avoiding
-         * a system call. We'll only really install the write handler if
-         * we'll not be able to write the whole reply at once. */
-        c->flags |= CLIENT_PENDING_WRITE;
-        listAddNodeHead(server.clients_pending_write,c);
-    }
+    /* Schedule the client to write the output buffers to the socket, unless
+     * it should already be setup to do so (it has already pending data). */
+    if (!clientHasPendingReplies(c)) clientInstallWriteHandler(c);
 
     /* Authorize the caller to queue in the output buffer of this client. */
     return C_OK;
@@ -354,19 +366,13 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
      * Where the master must propagate the first change even if the second
      * will produce an error. However it is useful to log such events since
      * they are rare and may hint at errors in a script or a bug in Redis. */
-    if (c->flags & (CLIENT_MASTER|CLIENT_SLAVE)) {
-        char* to = c->flags & CLIENT_MASTER? "master": "slave";
-        char* from = c->flags & CLIENT_MASTER? "slave": "master";
+    if (c->flags & (CLIENT_MASTER|CLIENT_SLAVE) && !(c->flags & CLIENT_MONITOR)) {
+        char* to = c->flags & CLIENT_MASTER? "master": "replica";
+        char* from = c->flags & CLIENT_MASTER? "replica": "master";
         char *cmdname = c->lastcmd ? c->lastcmd->name : "<unknown>";
         serverLog(LL_WARNING,"== CRITICAL == This %s is sending an error "
                              "to its %s: '%s' after processing the command "
                              "'%s'", from, to, s, cmdname);
-        /* Here we want to panic because when a master is sending an
-         * error to some slave in the context of replication, this can
-         * only create some kind of offset or data desynchronization. Better
-         * to catch it ASAP and crash instead of continuing. */
-        if (c->flags & CLIENT_SLAVE)
-            serverPanic("Continuing is unsafe: replication protocol violation.");
     }
 }
 
@@ -623,6 +629,19 @@ void addReplySubcommandSyntaxError(client *c) {
     sdsfree(cmd);
 }
 
+/* Append 'src' client output buffers into 'dst' client output buffers. 
+ * This function clears the output buffers of 'src' */
+void AddReplyFromClient(client *dst, client *src) {
+    if (prepareClientToWrite(dst) != C_OK)
+        return;
+    addReplyString(dst,src->buf, src->bufpos);
+    if (listLength(src->reply))
+        listJoin(dst->reply,src->reply);
+    dst->reply_bytes += src->reply_bytes;
+    src->reply_bytes = 0;
+    src->bufpos = 0;
+}
+
 /* Copy 'src' client output buffers into 'dst' client output buffers.
  * The function takes care of freeing the old output buffers of the
  * destination client. */
@@ -790,6 +809,16 @@ void unlinkClient(client *c) {
             c->client_list_node = NULL;
         }
 
+        /* In the case of diskless replication the fork is writing to the
+         * sockets and just closing the fd isn't enough, if we don't also
+         * shutdown the socket the fork will continue to write to the slave
+         * and the salve will only find out that it was disconnected when
+         * it will finish reading the rdb. */
+        if ((c->flags & CLIENT_SLAVE) &&
+            (c->replstate == SLAVE_STATE_WAIT_BGSAVE_END)) {
+            shutdown(c->fd, SHUT_RDWR);
+        }
+
         /* Unregister async I/O handlers and close the socket. */
         aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
         aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
@@ -818,6 +847,13 @@ void unlinkClient(client *c) {
 void freeClient(client *c) {
     listNode *ln;
 
+    /* If a client is protected, yet we need to free it right now, make sure
+     * to at least use asynchronous freeing. */
+    if (c->flags & CLIENT_PROTECTED) {
+        freeClientAsync(c);
+        return;
+    }
+
     /* If it is our master that's beging disconnected we should make sure
      * to cache the state to try a partial resynchronization later.
      *
@@ -827,8 +863,7 @@ void freeClient(client *c) {
         serverLog(LL_WARNING,"Connection with master lost.");
         if (!(c->flags & (CLIENT_CLOSE_AFTER_REPLY|
                           CLIENT_CLOSE_ASAP|
-                          CLIENT_BLOCKED|
-                          CLIENT_UNBLOCKED)))
+                          CLIENT_BLOCKED)))
         {
             replicationCacheMaster(c);
             return;
@@ -837,7 +872,7 @@ void freeClient(client *c) {
 
     /* Log link disconnection with slave */
     if ((c->flags & CLIENT_SLAVE) && !(c->flags & CLIENT_MONITOR)) {
-        serverLog(LL_WARNING,"Connection with slave %s lost.",
+        serverLog(LL_WARNING,"Connection with replica %s lost.",
             replicationGetSlaveName(c));
     }
 
@@ -1055,6 +1090,10 @@ int handleClientsWithPendingWrites(void) {
         c->flags &= ~CLIENT_PENDING_WRITE;
         listDelNode(server.clients_pending_write,ln);
 
+        /* If a client is protected, don't do anything,
+         * that may trigger write error or recreate handler. */
+        if (c->flags & CLIENT_PROTECTED) continue;
+
         /* Try to write buffers to the client socket. */
         if (writeToClient(c->fd,c,0) == C_ERR) continue;
 
@@ -1103,6 +1142,34 @@ void resetClient(client *c) {
     if (c->flags & CLIENT_REPLY_SKIP_NEXT) {
         c->flags |= CLIENT_REPLY_SKIP;
         c->flags &= ~CLIENT_REPLY_SKIP_NEXT;
+    }
+}
+
+/* This funciton is used when we want to re-enter the event loop but there
+ * is the risk that the client we are dealing with will be freed in some
+ * way. This happens for instance in:
+ *
+ * * DEBUG RELOAD and similar.
+ * * When a Lua script is in -BUSY state.
+ *
+ * So the function will protect the client by doing two things:
+ *
+ * 1) It removes the file events. This way it is not possible that an
+ *    error is signaled on the socket, freeing the client.
+ * 2) Moreover it makes sure that if the client is freed in a different code
+ *    path, it is not really released, but only marked for later release. */
+void protectClient(client *c) {
+    c->flags |= CLIENT_PROTECTED;
+    aeDeleteFileEvent(server.el,c->fd,AE_READABLE);
+    aeDeleteFileEvent(server.el,c->fd,AE_WRITABLE);
+}
+
+/* This will undo the client protection done by protectClient() */
+void unprotectClient(client *c) {
+    if (c->flags & CLIENT_PROTECTED) {
+        c->flags &= ~CLIENT_PROTECTED;
+        aeCreateFileEvent(server.el,c->fd,AE_READABLE,readQueryFromClient,c);
+        if (clientHasPendingReplies(c)) clientInstallWriteHandler(c);
     }
 }
 
@@ -1295,19 +1362,22 @@ int processMultibulkBuffer(client *c) {
 
             c->qb_pos = newline-c->querybuf+2;
             if (ll >= PROTO_MBULK_BIG_ARG) {
-                size_t qblen;
-
                 /* If we are going to read a large object from network
                  * try to make it likely that it will start at c->querybuf
                  * boundary so that we can optimize object creation
-                 * avoiding a large copy of data. */
-                sdsrange(c->querybuf,c->qb_pos,-1);
-                c->qb_pos = 0;
-                qblen = sdslen(c->querybuf);
-                /* Hint the sds library about the amount of bytes this string is
-                 * going to contain. */
-                if (qblen < (size_t)ll+2)
-                    c->querybuf = sdsMakeRoomFor(c->querybuf,ll+2-qblen);
+                 * avoiding a large copy of data.
+                 *
+                 * But only when the data we have not parsed is less than
+                 * or equal to ll+2. If the data length is greater than
+                 * ll+2, trimming querybuf is just a waste of time, because
+                 * at this time the querybuf contains not only our bulk. */
+                if (sdslen(c->querybuf)-c->qb_pos <= (size_t)ll+2) {
+                    sdsrange(c->querybuf,c->qb_pos,-1);
+                    c->qb_pos = 0;
+                    /* Hint the sds library about the amount of bytes this string is
+                     * going to contain. */
+                    c->querybuf = sdsMakeRoomFor(c->querybuf,ll+2);
+                }
             }
             c->bulklen = ll;
         }
@@ -1362,6 +1432,12 @@ void processInputBuffer(client *c) {
         /* Immediately abort if the client is in the middle of something. */
         if (c->flags & CLIENT_BLOCKED) break;
 
+        /* Don't process input from the master while there is a busy script
+         * condition on the slave. We want just to accumulate the replication
+         * stream (instead of replying -BUSY like we do with other clients) and
+         * later resume the processing. */
+        if (server.lua_timedout && c->flags & CLIENT_MASTER) break;
+
         /* CLIENT_CLOSE_AFTER_REPLY closes the connection once the reply is
          * written to the client. Make sure to not let the reply grow after
          * this flag has been set (i.e. don't process more commands).
@@ -1412,12 +1488,31 @@ void processInputBuffer(client *c) {
     }
 
     /* Trim to pos */
-    if (c->qb_pos) {
+    if (server.current_client != NULL && c->qb_pos) {
         sdsrange(c->querybuf,c->qb_pos,-1);
         c->qb_pos = 0;
     }
 
     server.current_client = NULL;
+}
+
+/* This is a wrapper for processInputBuffer that also cares about handling
+ * the replication forwarding to the sub-slaves, in case the client 'c'
+ * is flagged as master. Usually you want to call this instead of the
+ * raw processInputBuffer(). */
+void processInputBufferAndReplicate(client *c) {
+    if (!(c->flags & CLIENT_MASTER)) {
+        processInputBuffer(c);
+    } else {
+        size_t prev_offset = c->reploff;
+        processInputBuffer(c);
+        size_t applied = c->reploff - prev_offset;
+        if (applied) {
+            replicationFeedSlavesFromMasterStream(server.slaves,
+                    c->pending_querybuf, applied);
+            sdsrange(c->pending_querybuf,applied,-1);
+        }
+    }
 }
 
 void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -1439,7 +1534,9 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     {
         ssize_t remaining = (size_t)(c->bulklen+2)-sdslen(c->querybuf);
 
-        if (remaining < readlen) readlen = remaining;
+        /* Note that the 'remaining' variable may be zero in some edge case,
+         * for example once we resume a blocked client after CLIENT PAUSE. */
+        if (remaining > 0 && remaining < readlen) readlen = remaining;
     }
 
     qblen = sdslen(c->querybuf);
@@ -1487,18 +1584,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
      * was actually applied to the master state: this quantity, and its
      * corresponding part of the replication stream, will be propagated to
      * the sub-slaves and to the replication backlog. */
-    if (!(c->flags & CLIENT_MASTER)) {
-        processInputBuffer(c);
-    } else {
-        size_t prev_offset = c->reploff;
-        processInputBuffer(c);
-        size_t applied = c->reploff - prev_offset;
-        if (applied) {
-            replicationFeedSlavesFromMasterStream(server.slaves,
-                    c->pending_querybuf, applied);
-            sdsrange(c->pending_querybuf,applied,-1);
-        }
-    }
+    processInputBufferAndReplicate(c);
 }
 
 void getClientsMaxBuffers(unsigned long *longest_output_list,
@@ -1636,10 +1722,10 @@ void clientCommand(client *c) {
 "kill <ip:port>         -- Kill connection made from <ip:port>.",
 "kill <option> <value> [option value ...] -- Kill connections. Options are:",
 "     addr <ip:port>                      -- Kill connection made from <ip:port>",
-"     type (normal|master|slave|pubsub)   -- Kill connections by type.",
+"     type (normal|master|replica|pubsub) -- Kill connections by type.",
 "     skipme (yes|no)   -- Skip killing current connection (default: yes).",
 "list [options ...]     -- Return information about client connections. Options:",
-"     type (normal|master|slave|pubsub)   -- Return clients of specified type.",
+"     type (normal|master|replica|pubsub) -- Return clients of specified type.",
 "pause <timeout>        -- Suspend all Redis clients for <timout> milliseconds.",
 "reply (on|off|skip)    -- Control the replies sent to the current connection.",
 "setname <name>         -- Assign the name <name> to the current connection.",
@@ -1935,15 +2021,8 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
     }
 }
 
-/* This function returns the number of bytes that Redis is virtually
+/* This function returns the number of bytes that Redis is
  * using to store the reply still not read by the client.
- * It is "virtual" since the reply output list may contain objects that
- * are shared and are not really using additional memory.
- *
- * The function returns the total sum of the length of all the objects
- * stored in the output list, plus the memory used to allocate every
- * list node. The static reply buffer is not taken into account since it
- * is allocated anyway.
  *
  * Note: this function is very fast so can be called as many time as
  * the caller wishes. The main usage of this function currently is
@@ -1973,6 +2052,7 @@ int getClientType(client *c) {
 int getClientTypeByName(char *name) {
     if (!strcasecmp(name,"normal")) return CLIENT_TYPE_NORMAL;
     else if (!strcasecmp(name,"slave")) return CLIENT_TYPE_SLAVE;
+    else if (!strcasecmp(name,"replica")) return CLIENT_TYPE_SLAVE;
     else if (!strcasecmp(name,"pubsub")) return CLIENT_TYPE_PUBSUB;
     else if (!strcasecmp(name,"master")) return CLIENT_TYPE_MASTER;
     else return -1;
@@ -2040,6 +2120,7 @@ int checkClientOutputBufferLimits(client *c) {
  * called from contexts where the client can't be freed safely, i.e. from the
  * lower level functions pushing data inside the client output buffers. */
 void asyncCloseClientOnOutputBufferLimitReached(client *c) {
+    if (c->fd == -1) return; /* It is unsafe to free fake clients. */
     serverAssert(c->reply_bytes < SIZE_MAX-(1024*64));
     if (c->reply_bytes == 0 || c->flags & CLIENT_CLOSE_ASAP) return;
     if (checkClientOutputBufferLimits(c)) {
@@ -2062,17 +2143,27 @@ void flushSlavesOutputBuffers(void) {
     listRewind(server.slaves,&li);
     while((ln = listNext(&li))) {
         client *slave = listNodeValue(ln);
-        int events;
+        int events = aeGetFileEvents(server.el,slave->fd);
+        int can_receive_writes = (events & AE_WRITABLE) ||
+                                 (slave->flags & CLIENT_PENDING_WRITE);
 
-        /* Note that the following will not flush output buffers of slaves
-         * in STATE_ONLINE but having put_online_on_ack set to true: in this
-         * case the writable event is never installed, since the purpose
-         * of put_online_on_ack is to postpone the moment it is installed.
-         * This is what we want since slaves in this state should not receive
-         * writes before the first ACK. */
-        events = aeGetFileEvents(server.el,slave->fd);
-        if (events & AE_WRITABLE &&
-            slave->replstate == SLAVE_STATE_ONLINE &&
+        /* We don't want to send the pending data to the replica in a few
+         * cases:
+         *
+         * 1. For some reason there is neither the write handler installed
+         *    nor the client is flagged as to have pending writes: for some
+         *    reason this replica may not be set to receive data. This is
+         *    just for the sake of defensive programming.
+         *
+         * 2. The put_online_on_ack flag is true. To know why we don't want
+         *    to send data to the replica in this case, please grep for the
+         *    flag for this flag.
+         *
+         * 3. Obviously if the slave is not ONLINE.
+         */
+        if (slave->replstate == SLAVE_STATE_ONLINE &&
+            can_receive_writes &&
+            !slave->repl_put_online_on_ack &&
             clientHasPendingReplies(slave))
         {
             writeToClient(slave->fd,slave,0);
@@ -2121,11 +2212,10 @@ int clientsArePaused(void) {
         while ((ln = listNext(&li)) != NULL) {
             c = listNodeValue(ln);
 
-            /* Don't touch slaves and blocked clients. The latter pending
-             * requests be processed when unblocked. */
+            /* Don't touch slaves and blocked clients.
+             * The latter pending requests will be processed when unblocked. */
             if (c->flags & (CLIENT_SLAVE|CLIENT_BLOCKED)) continue;
-            c->flags |= CLIENT_UNBLOCKED;
-            listAddNodeTail(server.unblocked_clients,c);
+            queueClientForReprocessing(c);
         }
     }
     return server.clients_paused;

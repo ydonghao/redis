@@ -185,7 +185,7 @@ robj *createStringObjectFromLongDouble(long double value, int humanfriendly) {
 /* Duplicate a string object, with the guarantee that the returned object
  * has the same encoding as the original one.
  *
- * This function also guarantees that duplicating a small integere object
+ * This function also guarantees that duplicating a small integer object
  * (or a string object that contains a representation of a small integer)
  * will always result in a fresh object that is unshared (refcount == 1).
  *
@@ -415,6 +415,18 @@ int isObjectRepresentableAsLongLong(robj *o, long long *llval) {
     }
 }
 
+/* Optimize the SDS string inside the string object to require little space,
+ * in case there is more than 10% of free space at the end of the SDS
+ * string. This happens because SDS strings tend to overallocate to avoid
+ * wasting too much time in allocations when appending to the string. */
+void trimStringObjectIfNeeded(robj *o) {
+    if (o->encoding == OBJ_ENCODING_RAW &&
+        sdsavail(o->ptr) > sdslen(o->ptr)/10)
+    {
+        o->ptr = sdsRemoveFreeSpace(o->ptr);
+    }
+}
+
 /* Try to encode a string object in order to save space */
 robj *tryObjectEncoding(robj *o) {
     long value;
@@ -455,10 +467,15 @@ robj *tryObjectEncoding(robj *o) {
             incrRefCount(shared.integers[value]);
             return shared.integers[value];
         } else {
-            if (o->encoding == OBJ_ENCODING_RAW) sdsfree(o->ptr);
-            o->encoding = OBJ_ENCODING_INT;
-            o->ptr = (void*) value;
-            return o;
+            if (o->encoding == OBJ_ENCODING_RAW) {
+                sdsfree(o->ptr);
+                o->encoding = OBJ_ENCODING_INT;
+                o->ptr = (void*) value;
+                return o;
+            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
+                decrRefCount(o);
+                return createStringObjectFromLongLongForValue(value);
+            }
         }
     }
 
@@ -484,11 +501,7 @@ robj *tryObjectEncoding(robj *o) {
      * We do that only for relatively large strings as this branch
      * is only entered if the length of the string is greater than
      * OBJ_ENCODING_EMBSTR_SIZE_LIMIT. */
-    if (o->encoding == OBJ_ENCODING_RAW &&
-        sdsavail(s) > len/10)
-    {
-        o->ptr = sdsRemoveFreeSpace(o->ptr);
-    }
+    trimStringObjectIfNeeded(o);
 
     /* Return the original object. */
     return o;
@@ -826,7 +839,9 @@ size_t objectComputeSize(robj *o, size_t sample_size) {
             d = ((zset*)o->ptr)->dict;
             zskiplist *zsl = ((zset*)o->ptr)->zsl;
             zskiplistNode *znode = zsl->header->level[0].forward;
-            asize = sizeof(*o)+sizeof(zset)+(sizeof(struct dictEntry*)*dictSlots(d));
+            asize = sizeof(*o)+sizeof(zset)+sizeof(zskiplist)+sizeof(dict)+
+                    (sizeof(struct dictEntry*)*dictSlots(d))+
+                    zmalloc_size(zsl->header);
             while(znode != NULL && samples < sample_size) {
                 elesize += sdsAllocSize(znode->ele);
                 elesize += sizeof(struct dictEntry) + zmalloc_size(znode);
@@ -1011,13 +1026,13 @@ struct redisMemOverhead *getMemoryOverheadData(void) {
 
     mem = 0;
     if (server.aof_state != AOF_OFF) {
-        mem += sdslen(server.aof_buf);
+        mem += sdsalloc(server.aof_buf);
         mem += aofRewriteBufferSize();
     }
     mh->aof_buffer = mem;
     mem_total+=mem;
 
-    mem = 0;
+    mem = server.lua_scripts_mem;
     mem += dictSize(server.lua_scripts) * sizeof(dictEntry) +
         dictSlots(server.lua_scripts) * sizeof(dictEntry*);
     mem += dictSize(server.repl_scriptcache_dict) * sizeof(dictEntry) +
@@ -1175,7 +1190,7 @@ sds getMemoryDoctorReport(void) {
             s = sdscatprintf(s," * High process RSS overhead: This instance has non-allocator RSS memory overhead is greater than 1.1 (this means that the Resident Set Size of the Redis process is much larger than the RSS the allocator holds). This problem may be due to Lua scripts or Modules.\n\n");
         }
         if (big_slave_buf) {
-            s = sdscat(s," * Big slave buffers: The slave output buffers in this instance are greater than 10MB for each slave (on average). This likely means that there is some slave instance that is struggling receiving data, either because it is too slow or because of networking issues. As a result, data piles on the master output buffers. Please try to identify what slave is not receiving data correctly and why. You can use the INFO output in order to check the slaves delays and the CLIENT LIST command to check the output buffers of each slave.\n\n");
+            s = sdscat(s," * Big replica buffers: The replica output buffers in this instance are greater than 10MB for each replica (on average). This likely means that there is some replica instance that is struggling receiving data, either because it is too slow or because of networking issues. As a result, data piles on the master output buffers. Please try to identify what replica is not receiving data correctly and why. You can use the INFO output in order to check the replicas delays and the CLIENT LIST command to check the output buffers of each replica.\n\n");
         }
         if (big_client_buf) {
             s = sdscat(s," * Big client buffers: The clients output buffers in this instance are greater than 200K per client (on average). This may result from different causes, like Pub/Sub clients subscribed to channels bot not receiving data fast enough, so that data piles on the Redis instance output buffer, or clients sending commands with large replies or very large sequences of commands in the same pipeline. Please use the CLIENT LIST command in order to investigate the issue if it causes problems in your instance, or to understand better why certain clients are using a big amount of memory.\n\n");
@@ -1191,7 +1206,7 @@ sds getMemoryDoctorReport(void) {
 
 /* Set the object LRU/LFU depending on server.maxmemory_policy.
  * The lfu_freq arg is only relevant if policy is MAXMEMORY_FLAG_LFU.
- * The lru_idle and lru_clock args are only relevant if policy 
+ * The lru_idle and lru_clock args are only relevant if policy
  * is MAXMEMORY_FLAG_LRU.
  * Either or both of them may be <0, in that case, nothing is set. */
 void objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
@@ -1202,16 +1217,20 @@ void objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
             val->lru = (LFUGetTimeInMinutes()<<8) | lfu_freq;
         }
     } else if (lru_idle >= 0) {
-        /* Serialized LRU idle time is in seconds. Scale
+        /* Provided LRU idle time is in seconds. Scale
          * according to the LRU clock resolution this Redis
          * instance was compiled with (normally 1000 ms, so the
          * below statement will expand to lru_idle*1000/1000. */
         lru_idle = lru_idle*1000/LRU_CLOCK_RESOLUTION;
-        val->lru = lru_clock - lru_idle;
-        /* If the lru field overflows (since LRU it is a wrapping
-         * clock), the best we can do is to provide the maximum
-         * representable idle time. */
-        if (val->lru < 0) val->lru = lru_clock+1;
+        long lru_abs = lru_clock - lru_idle; /* Absolute access time. */
+        /* If the LRU field underflows (since LRU it is a wrapping
+         * clock), the best we can do is to provide a large enough LRU
+         * that is half-way in the circlular LRU clock we use: this way
+         * the computed idle time for this object will stay high for quite
+         * some time. */
+        if (lru_abs < 0)
+            lru_abs = (lru_clock+(LRU_CLOCK_MAX/2)) % LRU_CLOCK_MAX;
+        val->lru = lru_abs;
     }
 }
 
@@ -1285,9 +1304,18 @@ NULL
  *
  * Usage: MEMORY usage <key> */
 void memoryCommand(client *c) {
-    robj *o;
-
-    if (!strcasecmp(c->argv[1]->ptr,"usage") && c->argc >= 3) {
+    if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
+        const char *help[] = {
+"DOCTOR - Return memory problems reports.",
+"MALLOC-STATS -- Return internal statistics report from the memory allocator.",
+"PURGE -- Attempt to purge dirty pages for reclamation by the allocator.",
+"STATS -- Return information about the memory usage of the server.",
+"USAGE <key> [SAMPLES <count>] -- Return memory in bytes used by <key> and its value. Nested values are sampled up to <count> times (default: 5).",
+NULL
+        };
+        addReplyHelp(c, help);
+    } else if (!strcasecmp(c->argv[1]->ptr,"usage") && c->argc >= 3) {
+        dictEntry *de;
         long long samples = OBJ_COMPUTE_SIZE_DEF_SAMPLES;
         for (int j = 3; j < c->argc; j++) {
             if (!strcasecmp(c->argv[j]->ptr,"samples") &&
@@ -1306,10 +1334,12 @@ void memoryCommand(client *c) {
                 return;
             }
         }
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nullbulk))
-                == NULL) return;
-        size_t usage = objectComputeSize(o,samples);
-        usage += sdsAllocSize(c->argv[2]->ptr);
+        if ((de = dictFind(c->db->dict,c->argv[2]->ptr)) == NULL) {
+            addReply(c, shared.nullbulk);
+            return;
+        }
+        size_t usage = objectComputeSize(dictGetVal(de),samples);
+        usage += sdsAllocSize(dictGetKey(de));
         usage += sizeof(dictEntry);
         addReplyLongLong(c,usage);
     } else if (!strcasecmp(c->argv[1]->ptr,"stats") && c->argc == 2) {
@@ -1434,19 +1464,7 @@ void memoryCommand(client *c) {
         addReply(c, shared.ok);
         /* Nothing to do for other allocators. */
 #endif
-    } else if (!strcasecmp(c->argv[1]->ptr,"help") && c->argc == 2) {
-        addReplyMultiBulkLen(c,5);
-        addReplyBulkCString(c,
-"MEMORY DOCTOR                        - Outputs memory problems report");
-        addReplyBulkCString(c,
-"MEMORY USAGE <key> [SAMPLES <count>] - Estimate memory usage of key");
-        addReplyBulkCString(c,
-"MEMORY STATS                         - Show memory usage details");
-        addReplyBulkCString(c,
-"MEMORY PURGE                         - Ask the allocator to release memory");
-        addReplyBulkCString(c,
-"MEMORY MALLOC-STATS                  - Show allocator internal stats");
     } else {
-        addReplyError(c,"Syntax error. Try MEMORY HELP");
+        addReplyErrorFormat(c, "Unknown subcommand or wrong number of arguments for '%s'. Try MEMORY HELP", (char*)c->argv[1]->ptr);
     }
 }

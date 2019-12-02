@@ -164,7 +164,7 @@ void *zrealloc(void *ptr, size_t size) {
     if (!newptr) zmalloc_oom_handler(size);
 
     *((size_t*)newptr) = size;
-    update_zmalloc_stat_free(oldsize);
+    update_zmalloc_stat_free(oldsize+PREFIX_SIZE);
     update_zmalloc_stat_alloc(size+PREFIX_SIZE);
     return (char*)newptr+PREFIX_SIZE;
 #endif
@@ -323,6 +323,13 @@ int zmalloc_get_allocator_info(size_t *allocated,
     je_mallctl("stats.allocated", allocated, &sz, NULL, 0);
     return 1;
 }
+
+void set_jemalloc_bg_thread(int enable) {
+    /* let jemalloc do purging asynchronously, required when there's no traffic 
+     * after flushdb */
+    char val = !!enable;
+    je_mallctl("background_thread", NULL, 0, &val, 1);
+}
 #else
 int zmalloc_get_allocator_info(size_t *allocated,
                                size_t *active,
@@ -438,4 +445,20 @@ size_t zmalloc_get_memory_size(void) {
 #endif
 }
 
+#ifdef REDIS_TEST
+#define UNUSED(x) ((void)(x))
+int zmalloc_test(int argc, char **argv) {
+    void *ptr;
 
+    UNUSED(argc);
+    UNUSED(argv);
+    printf("Initial used memory: %zu\n", zmalloc_used_memory());
+    ptr = zmalloc(123);
+    printf("Allocated 123 bytes; used: %zu\n", zmalloc_used_memory());
+    ptr = zrealloc(ptr, 456);
+    printf("Reallocated to 456 bytes; used: %zu\n", zmalloc_used_memory());
+    zfree(ptr);
+    printf("Freed pointer; used: %zu\n", zmalloc_used_memory());
+    return 0;
+}
+#endif

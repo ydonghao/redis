@@ -200,8 +200,8 @@ struct redisCommand redisCommandTable[] = {
     {"zscan",zscanCommand,-3,"rR",0,NULL,1,1,1,0,0},
     {"zpopmin",zpopminCommand,-2,"wF",0,NULL,1,1,1,0,0},
     {"zpopmax",zpopmaxCommand,-2,"wF",0,NULL,1,1,1,0,0},
-    {"bzpopmin",bzpopminCommand,-2,"wsF",0,NULL,1,-2,1,0,0},
-    {"bzpopmax",bzpopmaxCommand,-2,"wsF",0,NULL,1,-2,1,0,0},
+    {"bzpopmin",bzpopminCommand,-3,"wsF",0,NULL,1,-2,1,0,0},
+    {"bzpopmax",bzpopmaxCommand,-3,"wsF",0,NULL,1,-2,1,0,0},
     {"hset",hsetCommand,-4,"wmF",0,NULL,1,1,1,0,0},
     {"hsetnx",hsetnxCommand,4,"wmF",0,NULL,1,1,1,0,0},
     {"hget",hgetCommand,3,"rF",0,NULL,1,1,1,0,0},
@@ -260,7 +260,8 @@ struct redisCommand redisCommandTable[] = {
     {"touch",touchCommand,-2,"rF",0,NULL,1,1,1,0,0},
     {"pttl",pttlCommand,2,"rFR",0,NULL,1,1,1,0,0},
     {"persist",persistCommand,2,"wF",0,NULL,1,1,1,0,0},
-    {"slaveof",slaveofCommand,3,"ast",0,NULL,0,0,0,0,0},
+    {"slaveof",replicaofCommand,3,"ast",0,NULL,0,0,0,0,0},
+    {"replicaof",replicaofCommand,3,"ast",0,NULL,0,0,0,0,0},
     {"role",roleCommand,1,"lst",0,NULL,0,0,0,0,0},
     {"debug",debugCommand,-2,"as",0,NULL,0,0,0,0,0},
     {"config",configCommand,-2,"last",0,NULL,0,0,0,0,0},
@@ -306,22 +307,24 @@ struct redisCommand redisCommandTable[] = {
     {"pfcount",pfcountCommand,-2,"r",0,NULL,1,-1,1,0,0},
     {"pfmerge",pfmergeCommand,-2,"wm",0,NULL,1,-1,1,0,0},
     {"pfdebug",pfdebugCommand,-3,"w",0,NULL,0,0,0,0,0},
-    {"xadd",xaddCommand,-5,"wmF",0,NULL,1,1,1,0,0},
+    {"xadd",xaddCommand,-5,"wmFR",0,NULL,1,1,1,0,0},
     {"xrange",xrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"xrevrange",xrevrangeCommand,-4,"r",0,NULL,1,1,1,0,0},
     {"xlen",xlenCommand,2,"rF",0,NULL,1,1,1,0,0},
     {"xread",xreadCommand,-4,"rs",0,xreadGetKeys,1,1,1,0,0},
     {"xreadgroup",xreadCommand,-7,"ws",0,xreadGetKeys,1,1,1,0,0},
     {"xgroup",xgroupCommand,-2,"wm",0,NULL,2,2,1,0,0},
+    {"xsetid",xsetidCommand,3,"wmF",0,NULL,1,1,1,0,0},
     {"xack",xackCommand,-4,"wF",0,NULL,1,1,1,0,0},
-    {"xpending",xpendingCommand,-3,"r",0,NULL,1,1,1,0,0},
-    {"xclaim",xclaimCommand,-6,"wF",0,NULL,1,1,1,0,0},
-    {"xinfo",xinfoCommand,-2,"r",0,NULL,2,2,1,0,0},
+    {"xpending",xpendingCommand,-3,"rR",0,NULL,1,1,1,0,0},
+    {"xclaim",xclaimCommand,-6,"wRF",0,NULL,1,1,1,0,0},
+    {"xinfo",xinfoCommand,-2,"rR",0,NULL,2,2,1,0,0},
     {"xdel",xdelCommand,-3,"wF",0,NULL,1,1,1,0,0},
-    {"xtrim",xtrimCommand,-2,"wF",0,NULL,1,1,1,0,0},
+    {"xtrim",xtrimCommand,-2,"wFR",0,NULL,1,1,1,0,0},
     {"post",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
     {"host:",securityWarningCommand,-1,"lt",0,NULL,0,0,0,0,0},
-    {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0}
+    {"latency",latencyCommand,-2,"aslt",0,NULL,0,0,0,0,0},
+    {"lolwut",lolwutCommand,-1,"r",0,NULL,0,0,0,0,0}
 };
 
 /*============================ Utility functions ============================ */
@@ -776,6 +779,11 @@ void updateDictResizePolicy(void) {
         dictDisableResize();
 }
 
+int hasActiveChildProcess() {
+    return server.rdb_child_pid != -1 ||
+           server.aof_child_pid != -1;
+}
+
 /* ======================= Cron: called every 100 ms ======================== */
 
 /* Add a sample to the operations per second array of samples. */
@@ -997,10 +1005,12 @@ void clientsCron(void) {
 void databasesCron(void) {
     /* Expire keys by random sampling. Not required for slaves
      * as master will synthesize DELs for us. */
-    if (server.active_expire_enabled && server.masterhost == NULL) {
-        activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW);
-    } else if (server.masterhost != NULL) {
-        expireSlaveKeys();
+    if (server.active_expire_enabled) {
+        if (server.masterhost == NULL) {
+            activeExpireCycle(ACTIVE_EXPIRE_CYCLE_SLOW);
+        } else {
+            expireSlaveKeys();
+        }
     }
 
     /* Defrag keys gradually. */
@@ -1049,19 +1059,30 @@ void databasesCron(void) {
 /* We take a cached value of the unix time in the global state because with
  * virtual memory and aging there is to store the current time in objects at
  * every object access, and accuracy is not needed. To access a global var is
- * a lot faster than calling time(NULL) */
-void updateCachedTime(void) {
-    time_t unixtime = time(NULL);
+ * a lot faster than calling time(NULL).
+ *
+ * This function should be fast because it is called at every command execution
+ * in call(), so it is possible to decide if to update the daylight saving
+ * info or not using the 'update_daylight_info' argument. Normally we update
+ * such info only when calling this function from serverCron() but not when
+ * calling it from call(). */
+void updateCachedTime(int update_daylight_info) {
+    server.ustime = ustime();
+    server.mstime = server.ustime / 1000;
+    time_t unixtime = server.mstime / 1000;
     atomicSet(server.unixtime,unixtime);
-    server.mstime = mstime();
 
-    /* To get information about daylight saving time, we need to call localtime_r
-     * and cache the result. However calling localtime_r in this context is safe
-     * since we will never fork() while here, in the main thread. The logging
-     * function will call a thread safe version of localtime that has no locks. */
-    struct tm tm;
-    localtime_r(&server.unixtime,&tm);
-    server.daylight_active = tm.tm_isdst;
+    /* To get information about daylight saving time, we need to call
+     * localtime_r and cache the result. However calling localtime_r in this
+     * context is safe since we will never fork() while here, in the main
+     * thread. The logging function will call a thread safe version of
+     * localtime that has no locks. */
+    if (update_daylight_info) {
+        struct tm tm;
+        time_t ut = server.unixtime;
+        localtime_r(&ut,&tm);
+        server.daylight_active = tm.tm_isdst;
+    }
 }
 
 /* This is our timer interrupt, called server.hz times per second.
@@ -1094,7 +1115,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     if (server.watchdog_period) watchdogScheduleSignal(server.watchdog_period);
 
     /* Update the time cache. */
-    updateCachedTime();
+    updateCachedTime(1);
 
     server.hz = server.config_hz;
     /* Adapt the server.hz value to the number of configured clients. If we have
@@ -1192,7 +1213,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     if (!server.sentinel_mode) {
         run_with_period(5000) {
             serverLog(LL_VERBOSE,
-                "%lu clients connected (%lu slaves), %zu bytes in use",
+                "%lu clients connected (%lu replicas), %zu bytes in use",
                 listLength(server.clients)-listLength(server.slaves),
                 listLength(server.slaves),
                 zmalloc_used_memory());
@@ -1320,9 +1341,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Run the Sentinel timer if we are in sentinel mode. */
-    run_with_period(100) {
-        if (server.sentinel_mode) sentinelTimer();
-    }
+    if (server.sentinel_mode) sentinelTimer();
 
     /* Cleanup expired MIGRATE cached sockets. */
     run_with_period(1000) {
@@ -1451,11 +1470,11 @@ void createSharedObjects(void) {
     shared.slowscripterr = createObject(OBJ_STRING,sdsnew(
         "-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n"));
     shared.masterdownerr = createObject(OBJ_STRING,sdsnew(
-        "-MASTERDOWN Link with MASTER is down and slave-serve-stale-data is set to 'no'.\r\n"));
+        "-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n"));
     shared.bgsaveerr = createObject(OBJ_STRING,sdsnew(
         "-MISCONF Redis is configured to save RDB snapshots, but it is currently not able to persist on disk. Commands that may modify the data set are disabled, because this instance is configured to report errors during writes if RDB snapshotting fails (stop-writes-on-bgsave-error option). Please check the Redis logs for details about the RDB error.\r\n"));
     shared.roslaveerr = createObject(OBJ_STRING,sdsnew(
-        "-READONLY You can't write against a read only slave.\r\n"));
+        "-READONLY You can't write against a read only replica.\r\n"));
     shared.noautherr = createObject(OBJ_STRING,sdsnew(
         "-NOAUTH Authentication required.\r\n"));
     shared.oomerr = createObject(OBJ_STRING,sdsnew(
@@ -1463,7 +1482,7 @@ void createSharedObjects(void) {
     shared.execaborterr = createObject(OBJ_STRING,sdsnew(
         "-EXECABORT Transaction discarded because of previous errors.\r\n"));
     shared.noreplicaserr = createObject(OBJ_STRING,sdsnew(
-        "-NOREPLICAS Not enough good slaves to write.\r\n"));
+        "-NOREPLICAS Not enough good replicas to write.\r\n"));
     shared.busykeyerr = createObject(OBJ_STRING,sdsnew(
         "-BUSYKEY Target key name already exists.\r\n"));
     shared.space = createObject(OBJ_STRING,sdsnew(" "));
@@ -1520,15 +1539,15 @@ void initServerConfig(void) {
     pthread_mutex_init(&server.lruclock_mutex,NULL);
     pthread_mutex_init(&server.unixtime_mutex,NULL);
 
-    updateCachedTime();
+    updateCachedTime(1);
     getRandomHexChars(server.runid,CONFIG_RUN_ID_SIZE);
     server.runid[CONFIG_RUN_ID_SIZE] = '\0';
     changeReplicationId();
     clearReplicationId2();
-    server.timezone = timezone; /* Initialized by tzset(). */
+    server.timezone = getTimeZone(); /* Initialized by tzset(). */
     server.configfile = NULL;
     server.executable = NULL;
-    server.config_hz = CONFIG_DEFAULT_HZ;
+    server.hz = server.config_hz = CONFIG_DEFAULT_HZ;
     server.dynamic_hz = CONFIG_DEFAULT_DYNAMIC_HZ;
     server.arch_bits = (sizeof(long) == 8) ? 64 : 32;
     server.port = CONFIG_DEFAULT_SERVER_PORT;
@@ -1621,6 +1640,7 @@ void initServerConfig(void) {
     server.cluster_announce_ip = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_IP;
     server.cluster_announce_port = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_PORT;
     server.cluster_announce_bus_port = CONFIG_DEFAULT_CLUSTER_ANNOUNCE_BUS_PORT;
+    server.cluster_module_flags = CLUSTER_MODULE_FLAG_NONE;
     server.migrate_cached_sockets = dictCreate(&migrateCacheDictType,NULL);
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.loading_process_events_interval_bytes = (1024*1024*2);
@@ -1701,6 +1721,7 @@ void initServerConfig(void) {
     server.expireCommand = lookupCommandByCString("expire");
     server.pexpireCommand = lookupCommandByCString("pexpire");
     server.xclaimCommand = lookupCommandByCString("xclaim");
+    server.xgroupCommand = lookupCommandByCString("xgroup");
 
     /* Slow log */
     server.slowlog_log_slower_than = CONFIG_DEFAULT_SLOWLOG_LOG_SLOWER_THAN;
@@ -1715,6 +1736,12 @@ void initServerConfig(void) {
     server.assert_line = 0;
     server.bug_report_start = 0;
     server.watchdog_period = 0;
+
+    /* By default we want scripts to be always replicated by effects
+     * (single commands executed by the script), and not by sending the
+     * script to the slave / AOF. This is the new way starting from
+     * Redis 5. However it is possible to revert it via redis.conf. */
+    server.lua_always_replicate_commands = 1;
 }
 
 extern char **environ;
@@ -1949,9 +1976,13 @@ int listenToPort(int port, int *fds, int *count) {
         }
         if (fds[*count] == ANET_ERR) {
             serverLog(LL_WARNING,
-                "Creating Server TCP listening socket %s:%d: %s",
+                "Could not create server TCP listening socket %s:%d: %s",
                 server.bindaddr[j] ? server.bindaddr[j] : "*",
                 port, server.neterr);
+                if (errno == ENOPROTOOPT     || errno == EPROTONOSUPPORT ||
+                    errno == ESOCKTNOSUPPORT || errno == EPFNOSUPPORT ||
+                    errno == EAFNOSUPPORT    || errno == EADDRNOTAVAIL)
+                    continue;
             return C_ERR;
         }
         anetNonBlock(NULL,fds[*count]);
@@ -2012,6 +2043,7 @@ void initServer(void) {
     server.hz = server.config_hz;
     server.pid = getpid();
     server.current_client = NULL;
+    server.fixed_time_expire = 0;
     server.clients = listCreate();
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
@@ -2164,6 +2196,14 @@ void initServer(void) {
     scriptingInit(1);
     slowlogInit();
     latencyMonitorInit();
+}
+
+/* Some steps in server initialization need to be done last (after modules
+ * are loaded).
+ * Specifically, creation of threads due to a race bug in ld.so, in which
+ * Thread Local Storage initialization collides with dlopen call.
+ * see: https://sourceware.org/bugzilla/show_bug.cgi?id=19329 */
+void InitServerLast() {
     bioInit();
     server.initial_memory_usage = zmalloc_used_memory();
 }
@@ -2399,8 +2439,12 @@ void preventCommandReplication(client *c) {
  *
  */
 void call(client *c, int flags) {
-    long long dirty, start, duration;
+    long long dirty;
+    ustime_t start, duration;
     int client_old_flags = c->flags;
+    struct redisCommand *real_cmd = c->cmd;
+
+    server.fixed_time_expire++;
 
     /* Sent the command to clients in MONITOR mode, only if the commands are
      * not generated from reading an AOF. */
@@ -2419,7 +2463,8 @@ void call(client *c, int flags) {
 
     /* Call the command. */
     dirty = server.dirty;
-    start = ustime();
+    updateCachedTime(0);
+    start = server.ustime;
     c->cmd->proc(c);
     duration = ustime()-start;
     dirty = server.dirty-dirty;
@@ -2449,8 +2494,11 @@ void call(client *c, int flags) {
         slowlogPushEntryIfNeeded(c,c->argv,c->argc,duration);
     }
     if (flags & CMD_CALL_STATS) {
-        c->lastcmd->microseconds += duration;
-        c->lastcmd->calls++;
+        /* use the real command that was executed (cmd and lastamc) may be
+         * different, in case of MULTI-EXEC or re-written commands such as
+         * EXPIRE, GEOADD, etc. */
+        real_cmd->microseconds += duration;
+        real_cmd->calls++;
     }
 
     /* Propagate the command into the AOF and replication link */
@@ -2512,6 +2560,7 @@ void call(client *c, int flags) {
         redisOpArrayFree(&server.also_propagate);
     }
     server.also_propagate = prev_also_propagate;
+    server.fixed_time_expire--;
     server.stat_numcommands++;
 }
 
@@ -2524,6 +2573,8 @@ void call(client *c, int flags) {
  * other operations can be performed by the caller. Otherwise
  * if C_ERR is returned the client was destroyed (i.e. after QUIT). */
 int processCommand(client *c) {
+    moduleCallCommandFilters(c);
+
     /* The QUIT command is handled separately. Normal command procs will
      * go through checking for replication and QUIT will cause trouble
      * when FORCE_REPLICATION is enabled and would be implemented in
@@ -2591,18 +2642,22 @@ int processCommand(client *c) {
 
     /* Handle the maxmemory directive.
      *
-     * First we try to free some memory if possible (if there are volatile
-     * keys in the dataset). If there are not the only thing we can do
-     * is returning an error. */
-    if (server.maxmemory) {
-        int out_of_memory = freeMemoryIfNeeded() == C_ERR;
+     * Note that we do not want to reclaim memory if we are here re-entering
+     * the event loop since there is a busy Lua script running in timeout
+     * condition, to avoid mixing the propagation of scripts with the
+     * propagation of DELs due to eviction. */
+    if (server.maxmemory && !server.lua_timedout) {
+        int out_of_memory = freeMemoryIfNeededAndSafe() == C_ERR;
         /* freeMemoryIfNeeded may flush slave output buffers. This may result
          * into a slave, that may be the active client, to be freed. */
         if (server.current_client == NULL) return C_ERR;
 
         /* It was impossible to free enough memory, and the command the client
-         * is trying to execute is denied during OOM conditions? Error. */
-        if ((c->cmd->flags & CMD_DENYOOM) && out_of_memory) {
+         * is trying to execute is denied during OOM conditions or the client
+         * is in MULTI/EXEC context? Error. */
+        if (out_of_memory &&
+            (c->cmd->flags & CMD_DENYOOM ||
+             (c->flags & CLIENT_MULTI && c->cmd->proc != execCommand))) {
             flagTransaction(c);
             addReply(c, shared.oomerr);
             return C_OK;
@@ -3188,7 +3243,7 @@ sds genRedisInfoString(char *section) {
         bytesToHuman(peak_hmem,server.stat_peak_memory);
         bytesToHuman(total_system_hmem,total_system_mem);
         bytesToHuman(used_memory_lua_hmem,memory_lua);
-        bytesToHuman(used_memory_scripts_hmem,server.lua_scripts_mem);
+        bytesToHuman(used_memory_scripts_hmem,mh->lua_caches);
         bytesToHuman(used_memory_rss_hmem,server.cron_malloc_stats.process_rss);
         bytesToHuman(maxmemory_hmem,server.maxmemory);
 
@@ -3222,11 +3277,11 @@ sds genRedisInfoString(char *section) {
             "allocator_frag_ratio:%.2f\r\n"
             "allocator_frag_bytes:%zu\r\n"
             "allocator_rss_ratio:%.2f\r\n"
-            "allocator_rss_bytes:%zu\r\n"
+            "allocator_rss_bytes:%zd\r\n"
             "rss_overhead_ratio:%.2f\r\n"
-            "rss_overhead_bytes:%zu\r\n"
+            "rss_overhead_bytes:%zd\r\n"
             "mem_fragmentation_ratio:%.2f\r\n"
-            "mem_fragmentation_bytes:%zu\r\n"
+            "mem_fragmentation_bytes:%zd\r\n"
             "mem_not_counted_for_evict:%zu\r\n"
             "mem_replication_backlog:%zu\r\n"
             "mem_clients_slaves:%zu\r\n"
@@ -3253,7 +3308,7 @@ sds genRedisInfoString(char *section) {
             total_system_hmem,
             memory_lua,
             used_memory_lua_hmem,
-            server.lua_scripts_mem,
+            (long long) mh->lua_caches,
             used_memory_scripts_hmem,
             dictSize(server.lua_scripts),
             server.maxmemory,
@@ -3716,7 +3771,7 @@ void usage(void) {
     fprintf(stderr,"       ./redis-server (run the server with default conf)\n");
     fprintf(stderr,"       ./redis-server /etc/redis/6379.conf\n");
     fprintf(stderr,"       ./redis-server --port 7777\n");
-    fprintf(stderr,"       ./redis-server --port 7777 --slaveof 127.0.0.1 8888\n");
+    fprintf(stderr,"       ./redis-server --port 7777 --replicaof 127.0.0.1 8888\n");
     fprintf(stderr,"       ./redis-server /etc/myredis.conf --loglevel verbose\n\n");
     fprintf(stderr,"Sentinel mode:\n");
     fprintf(stderr,"       ./redis-server /etc/sentinel.conf --sentinel\n");
@@ -3782,6 +3837,7 @@ static void sigShutdownHandler(int sig) {
         rdbRemoveTempFile(getpid());
         exit(1); /* Exit with an error since this was not a clean shutdown. */
     } else if (server.loading) {
+        serverLogFromHandler(LL_WARNING, "Received shutdown signal during loading, exiting now.");
         exit(0);
     }
 
@@ -3838,12 +3894,14 @@ void loadDataFromDisk(void) {
                 (float)(ustime()-start)/1000000);
 
             /* Restore the replication ID / offset from the RDB file. */
-            if (server.masterhost &&
+            if ((server.masterhost ||
+                (server.cluster_enabled &&
+                nodeIsSlave(server.cluster->myself))) &&
                 rsi.repl_id_is_set &&
                 rsi.repl_offset != -1 &&
                 /* Note that older implementations may save a repl_stream_db
-                 * of -1 inside the RDB file in a wrong way, see more information
-                 * in function rdbPopulateSaveInfo. */
+                 * of -1 inside the RDB file in a wrong way, see more
+                 * information in function rdbPopulateSaveInfo. */
                 rsi.repl_stream_db != -1)
             {
                 memcpy(server.replid,rsi.repl_id,sizeof(server.replid));
@@ -3997,12 +4055,12 @@ int main(int argc, char **argv) {
             return sha1Test(argc, argv);
         } else if (!strcasecmp(argv[2], "util")) {
             return utilTest(argc, argv);
-        } else if (!strcasecmp(argv[2], "sds")) {
-            return sdsTest(argc, argv);
         } else if (!strcasecmp(argv[2], "endianconv")) {
             return endianconvTest(argc, argv);
         } else if (!strcasecmp(argv[2], "crc64")) {
             return crc64Test(argc, argv);
+        } else if (!strcasecmp(argv[2], "zmalloc")) {
+            return zmalloc_test(argc, argv);
         }
 
         return -1; /* test not found */
@@ -4147,6 +4205,7 @@ int main(int argc, char **argv) {
         linuxMemoryWarnings();
     #endif
         moduleLoadFromQueue();
+        InitServerLast();
         loadDataFromDisk();
         if (server.cluster_enabled) {
             if (verifyClusterConfigWithData() == C_ERR) {
@@ -4161,6 +4220,7 @@ int main(int argc, char **argv) {
         if (server.sofd > 0)
             serverLog(LL_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
     } else {
+        InitServerLast();
         sentinelIsRunning();
     }
 

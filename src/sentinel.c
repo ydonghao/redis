@@ -452,13 +452,15 @@ struct redisCommand sentinelcmds[] = {
     {"info",sentinelInfoCommand,-1,"",0,NULL,0,0,0,0,0},
     {"role",sentinelRoleCommand,1,"l",0,NULL,0,0,0,0,0},
     {"client",clientCommand,-2,"rs",0,NULL,0,0,0,0,0},
-    {"shutdown",shutdownCommand,-1,"",0,NULL,0,0,0,0,0}
+    {"shutdown",shutdownCommand,-1,"",0,NULL,0,0,0,0,0},
+    {"auth",authCommand,2,"sltF",0,NULL,0,0,0,0,0}
 };
 
 /* This function overwrites a few normal Redis config default with Sentinel
  * specific defaults. */
 void initSentinelConfig(void) {
     server.port = REDIS_SENTINEL_PORT;
+    server.protected_mode = 0; /* Sentinel must be exposed. */
 }
 
 /* Perform the Sentinel mode initialization. */
@@ -1687,16 +1689,18 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
         ri = sentinelGetMasterByName(argv[1]);
         if (!ri) return "No such master with specified name.";
         ri->leader_epoch = strtoull(argv[2],NULL,10);
-    } else if (!strcasecmp(argv[0],"known-slave") && argc == 4) {
+    } else if ((!strcasecmp(argv[0],"known-slave") ||
+                !strcasecmp(argv[0],"known-replica")) && argc == 4)
+    {
         sentinelRedisInstance *slave;
 
-        /* known-slave <name> <ip> <port> */
+        /* known-replica <name> <ip> <port> */
         ri = sentinelGetMasterByName(argv[1]);
         if (!ri) return "No such master with specified name.";
         if ((slave = createSentinelRedisInstance(NULL,SRI_SLAVE,argv[2],
                     atoi(argv[3]), ri->quorum, ri)) == NULL)
         {
-            return "Wrong hostname or port for slave.";
+            return "Wrong hostname or port for replica.";
         }
     } else if (!strcasecmp(argv[0],"known-sentinel") &&
                (argc == 4 || argc == 5)) {
@@ -1854,7 +1858,7 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state) {
             if (sentinelAddrIsEqual(slave_addr,master_addr))
                 slave_addr = master->addr;
             line = sdscatprintf(sdsempty(),
-                "sentinel known-slave %s %s %d",
+                "sentinel known-replica %s %s %d",
                 master->name, slave_addr->ip, slave_addr->port);
             rewriteConfigRewriteLine(state,"sentinel",line,1);
         }
@@ -1939,12 +1943,25 @@ werr:
 /* Send the AUTH command with the specified master password if needed.
  * Note that for slaves the password set for the master is used.
  *
+ * In case this Sentinel requires a password as well, via the "requirepass"
+ * configuration directive, we assume we should use the local password in
+ * order to authenticate when connecting with the other Sentinels as well.
+ * So basically all the Sentinels share the same password and use it to
+ * authenticate reciprocally.
+ *
  * We don't check at all if the command was successfully transmitted
  * to the instance as if it fails Sentinel will detect the instance down,
  * will disconnect and reconnect the link and so forth. */
 void sentinelSendAuthIfNeeded(sentinelRedisInstance *ri, redisAsyncContext *c) {
-    char *auth_pass = (ri->flags & SRI_MASTER) ? ri->auth_pass :
-                                                 ri->master->auth_pass;
+    char *auth_pass = NULL;
+
+    if (ri->flags & SRI_MASTER) {
+        auth_pass = ri->auth_pass;
+    } else if (ri->flags & SRI_SLAVE) {
+        auth_pass = ri->master->auth_pass;
+    } else if (ri->flags & SRI_SENTINEL) {
+        if (server.requirepass) auth_pass = server.requirepass;
+    }
 
     if (auth_pass) {
         if (redisAsyncCommand(c, sentinelDiscardReplyCallback, ri, "%s %s",
@@ -2628,7 +2645,7 @@ int sentinelSendPing(sentinelRedisInstance *ri) {
         ri->link->last_ping_time = mstime();
         /* We update the active ping time only if we received the pong for
          * the previous ping, otherwise we are technically waiting since the
-         * first ping that did not received a reply. */
+         * first ping that did not receive a reply. */
         if (ri->link->act_ping_time == 0)
             ri->link->act_ping_time = ri->link->last_ping_time;
         return 1;
@@ -2978,8 +2995,10 @@ void sentinelCommand(client *c) {
         if ((ri = sentinelGetMasterByNameOrReplyError(c,c->argv[2]))
             == NULL) return;
         addReplySentinelRedisInstance(c,ri);
-    } else if (!strcasecmp(c->argv[1]->ptr,"slaves")) {
-        /* SENTINEL SLAVES <master-name> */
+    } else if (!strcasecmp(c->argv[1]->ptr,"slaves") ||
+               !strcasecmp(c->argv[1]->ptr,"replicas"))
+    {
+        /* SENTINEL REPLICAS <master-name> */
         sentinelRedisInstance *ri;
 
         if (c->argc != 3) goto numargserr;
@@ -3079,7 +3098,7 @@ void sentinelCommand(client *c) {
             return;
         }
         if (sentinelSelectSlave(ri) == NULL) {
-            addReplySds(c,sdsnew("-NOGOODSLAVE No suitable slave to promote\r\n"));
+            addReplySds(c,sdsnew("-NOGOODSLAVE No suitable replica to promote\r\n"));
             return;
         }
         serverLog(LL_WARNING,"Executing user requested FAILOVER of '%s'",
@@ -3261,7 +3280,7 @@ void sentinelCommand(client *c) {
                 sentinel.simfailure_flags |=
                     SENTINEL_SIMFAILURE_CRASH_AFTER_PROMOTION;
                 serverLog(LL_WARNING,"Failure simulation: this Sentinel "
-                    "will crash after promoting the selected slave to master");
+                    "will crash after promoting the selected replica to master");
             } else if (!strcasecmp(c->argv[j]->ptr,"help")) {
                 addReplyMultiBulkLen(c,2);
                 addReplyBulkCString(c,"crash-after-election");
@@ -3569,7 +3588,7 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
         (mstime() - ri->link->cc_conn_time) >
         SENTINEL_MIN_LINK_RECONNECT_PERIOD &&
         ri->link->act_ping_time != 0 && /* There is a pending ping... */
-        /* The pending ping is delayed, and we did not received
+        /* The pending ping is delayed, and we did not receive
          * error replies as well. */
         (mstime() - ri->link->act_ping_time) > (ri->down_after_period/2) &&
         (mstime() - ri->link->last_pong_time) > (ri->down_after_period/2))
@@ -3725,7 +3744,7 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
          *
          * 1) We believe it is down, or there is a failover in progress.
          * 2) Sentinel is connected.
-         * 3) We did not received the info within SENTINEL_ASK_PERIOD ms. */
+         * 3) We did not receive the info within SENTINEL_ASK_PERIOD ms. */
         if ((master->flags & SRI_S_DOWN) == 0) continue;
         if (ri->link->disconnected) continue;
         if (!(flags & SENTINEL_ASK_FORCED) &&
